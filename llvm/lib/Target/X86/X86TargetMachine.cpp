@@ -217,7 +217,7 @@ X86TargetMachine::X86TargetMachine(const Target &T, const Triple &TT,
           getEffectiveRelocModel(TT, JIT, RM),
           getEffectiveX86CodeModel(CM, JIT, TT.getArch() == Triple::x86_64),
           OL),
-      TLOF(createTLOF(getTargetTriple())) {
+      TLOF(createTLOF(getTargetTriple())), IsJIT(JIT) {
   // Windows stack unwinder gets confused when execution flow "falls through"
   // after a call to 'noreturn' function.
   // To prevent that, we emit a trap for 'unreachable' IR instructions.
