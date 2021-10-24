@@ -29,7 +29,10 @@
 using namespace __asan;
 
 static uptr allocated_for_dlsym;
-static uptr last_dlsym_alloc_size_in_words;
+static uptr last_dlsym_alloc_size_in_words[2];
+const void *last_dlsym_alloc[2];
+static int last_dlsym_alloc_size_in_words_index = -1;
+const void *last_freed_dlsym_alloc;
 static const uptr kDlsymAllocPoolSize = 1024;
 static uptr alloc_memory_for_dlsym[kDlsymAllocPoolSize];
 
@@ -41,7 +44,11 @@ static inline bool IsInDlsymAllocPool(const void *ptr) {
 static void *AllocateFromLocalPool(uptr size_in_bytes) {
   uptr size_in_words = RoundUpTo(size_in_bytes, kWordSize) / kWordSize;
   void *mem = (void*)&alloc_memory_for_dlsym[allocated_for_dlsym];
-  last_dlsym_alloc_size_in_words = size_in_words;
+  last_dlsym_alloc_size_in_words_index++;
+  last_dlsym_alloc_size_in_words_index &= 1;
+  last_dlsym_alloc_size_in_words[last_dlsym_alloc_size_in_words_index]
+    = size_in_words;
+  last_dlsym_alloc[last_dlsym_alloc_size_in_words_index] = mem;
   allocated_for_dlsym += size_in_words;
   CHECK_LT(allocated_for_dlsym, kDlsymAllocPoolSize);
   return mem;
@@ -51,13 +58,52 @@ static void DeallocateFromLocalPool(const void *ptr) {
   // Hack: since glibc 2.27 dlsym no longer uses stack-allocated memory to store
   // error messages and instead uses malloc followed by free. To avoid pool
   // exhaustion due to long object filenames, handle that special case here.
-  uptr prev_offset = allocated_for_dlsym - last_dlsym_alloc_size_in_words;
-  void *prev_mem = (void*)&alloc_memory_for_dlsym[prev_offset];
-  if (prev_mem == ptr) {
-    REAL(memset)(prev_mem, 0, last_dlsym_alloc_size_in_words * kWordSize);
-    allocated_for_dlsym = prev_offset;
-    last_dlsym_alloc_size_in_words = 0;
+  uptr prev_dlsym_alloc_size_in_words;
+  uptr prev_offset;
+  void *prev_mem;
+  if (last_dlsym_alloc_size_in_words_index == 0) {
+    prev_dlsym_alloc_size_in_words = last_dlsym_alloc_size_in_words[0];
+    prev_offset = allocated_for_dlsym - prev_dlsym_alloc_size_in_words;
+    prev_mem = (void*)&alloc_memory_for_dlsym[prev_offset];
+    if (prev_mem == ptr) {
+      REAL(memset)(prev_mem, 0, prev_dlsym_alloc_size_in_words * kWordSize);
+      allocated_for_dlsym = prev_offset;
+      last_dlsym_alloc_size_in_words[0] = 0;
+      last_dlsym_alloc[0] = nullptr;
+      last_dlsym_alloc_size_in_words_index = -1;
+      last_freed_dlsym_alloc = nullptr;
+      return;
+    }
   }
+
+  if (last_dlsym_alloc_size_in_words_index == 1) {
+    // Hack: Since glibc 2.34, dlsym does
+    //   1. malloc 1
+    //   2. malloc 2
+    //   3. free pointer from malloc 1
+    //   4. free pointer from malloc 2
+    // Free memory from malloc 1 and malloc 2 together.
+    if (last_freed_dlsym_alloc == last_dlsym_alloc[0] &&
+        ptr == last_dlsym_alloc[1]) {
+      prev_dlsym_alloc_size_in_words = last_dlsym_alloc_size_in_words[0]
+        + last_dlsym_alloc_size_in_words[1];
+      prev_offset = allocated_for_dlsym - prev_dlsym_alloc_size_in_words;
+      void *prev_mem = (void*)&alloc_memory_for_dlsym[prev_offset];
+      if (prev_mem == last_freed_dlsym_alloc) {
+        REAL(memset)(prev_mem, 0, prev_dlsym_alloc_size_in_words * kWordSize);
+        allocated_for_dlsym = prev_offset;
+        last_dlsym_alloc_size_in_words[0] = 0;
+        last_dlsym_alloc_size_in_words[1] = 0;
+        last_dlsym_alloc[0] = nullptr;
+        last_dlsym_alloc[1] = nullptr;
+        last_dlsym_alloc_size_in_words_index = -1;
+        last_freed_dlsym_alloc = nullptr;
+        return;
+      }
+    }
+  }
+
+  last_freed_dlsym_alloc = ptr;
 }
 
 static int PosixMemalignFromLocalPool(void **memptr, uptr alignment,
